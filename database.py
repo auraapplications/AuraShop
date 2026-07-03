@@ -56,6 +56,8 @@ def init_db():
             imagem          TEXT,
             preco_base      REAL DEFAULT 0,
             discloud_app_id TEXT,
+            tipo            TEXT DEFAULT 'bot',
+            destaque        INTEGER DEFAULT 0,
             criado_em       TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -91,6 +93,30 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS carrinho (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            produto_id INTEGER NOT NULL,
+            plano_id   INTEGER NOT NULL,
+            discord_id TEXT,
+            criado_em  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS discord_users (
+            discord_id   TEXT PRIMARY KEY,
+            username     TEXT,
+            discriminator TEXT,
+            avatar       TEXT,
+            email        TEXT,
+            access_token TEXT,
+            refresh_token TEXT,
+            ultimo_login TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS cupons (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             codigo      TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -109,6 +135,12 @@ def init_db():
         "ALTER TABLE pedidos ADD COLUMN cupom_codigo TEXT",
         "ALTER TABLE pedidos ADD COLUMN desconto REAL DEFAULT 0",
         "ALTER TABLE produtos ADD COLUMN destaque INTEGER DEFAULT 0",
+        "ALTER TABLE produtos ADD COLUMN tipo TEXT DEFAULT 'bot'",
+        "ALTER TABLE produtos ADD COLUMN pre_venda INTEGER DEFAULT 0",
+        "ALTER TABLE produtos ADD COLUMN pre_venda_desconto REAL DEFAULT 0",
+        "ALTER TABLE produtos ADD COLUMN pre_venda_data TEXT",
+        "ALTER TABLE produtos ADD COLUMN tag_novo INTEGER DEFAULT 0",
+        "ALTER TABLE produtos ADD COLUMN tag_novo_ate TEXT",
     ]:
         try:
             cur.execute(migration)
@@ -117,7 +149,7 @@ def init_db():
 
     defaults = {
         "nome_loja":          "BotStore",
-        "descricao_loja":     "Os melhores bots para o seu servidor Discord",
+        "descricao_loja":     "Os melhores bots e sites para o seu servidor Discord",
         "admin_password":     "admin123",
         "provedor_pix_ativo": "",
         "mp_token":           "",
@@ -138,6 +170,8 @@ def init_db():
         "banner_cor":         "primary",
         "dm_mensagem_extra":  "",
         "purincash_token":    "",
+        "discord_client_id":  os.getenv("DISCORD_CLIENT_ID", ""),
+        "discord_client_secret": os.getenv("DISCORD_CLIENT_SECRET", ""),
     }
     for chave, valor in defaults.items():
         cur.execute(

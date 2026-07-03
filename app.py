@@ -222,6 +222,7 @@ def notificar_bot(pedido, produto, plano):
                 "produto_id":   produto.get("id"),
                 "plano_id":     plano.get("id"),
                 "dias":         int(plano.get("dias", 30)),
+                "tipo":         produto.get("tipo", "bot"),
             },
             timeout=10
         )
@@ -235,23 +236,44 @@ def notificar_bot(pedido, produto, plano):
 def index():
     cfg = get_config()
     con = get_conn()
-    produtos = con.execute("SELECT * FROM produtos ORDER BY id DESC").fetchall()
+    tipo_filtro = request.args.get("tipo", "")
+    query = "SELECT * FROM produtos"
+    if tipo_filtro in ("bot", "site"):
+        query += f" WHERE tipo='{tipo_filtro}'"
+    query += " ORDER BY destaque DESC, id DESC"
+    produtos = con.execute(query).fetchall()
     resultado = []
+    hoje = datetime.utcnow().isoformat()
     for p in produtos:
         row = con.execute("SELECT MIN(preco) as mp FROM planos WHERE produto_id=?", (p["id"],)).fetchone()
-        resultado.append({**dict(p), "min_preco": row["mp"] or p["preco_base"]})
-    return render_template("index.html", cfg=cfg, produtos=resultado)
+        d = {**dict(p), "min_preco": row["mp"] or p["preco_base"]}
+        # Tag "Novo" automática (produto criado nos últimos 7 dias)
+        if p["criado_em"] and p["criado_em"] > (datetime.utcnow().isoformat()[:10] + "T00:00:00"):
+            pass  # já é novo pelo criado_em
+        resultado.append(d)
+    user = get_discord_user()
+    carrinho_count = con.execute(
+        "SELECT COUNT(*) as c FROM carrinho WHERE session_id=?", (get_session_id(),)
+    ).fetchone()["c"]
+    return render_template("index.html", cfg=cfg, produtos=resultado,
+                           tipo_filtro=tipo_filtro, user=user,
+                           carrinho_count=carrinho_count)
 
 @app.route("/produto/<int:pid>")
 def produto(pid):
-    cfg = get_config()
-    con = get_conn()
-    p = con.execute("SELECT * FROM produtos WHERE id=?", (pid,)).fetchone()
+    cfg  = get_config()
+    user = get_discord_user()
+    con  = get_conn()
+    p    = con.execute("SELECT * FROM produtos WHERE id=?", (pid,)).fetchone()
     if not p:
         abort(404)
     planos = con.execute("SELECT * FROM planos WHERE produto_id=? ORDER BY preco", (pid,)).fetchall()
+    carrinho_count = con.execute(
+        "SELECT COUNT(*) as c FROM carrinho WHERE session_id=?", (get_session_id(),)
+    ).fetchone()["c"]
     return render_template("produto.html", cfg=cfg, produto=dict(p),
-                           planos=[dict(pl) for pl in planos])
+                           planos=[dict(pl) for pl in planos],
+                           user=user, carrinho_count=carrinho_count)
 
 @app.route("/checkout", methods=["POST"])
 def checkout():
@@ -474,7 +496,254 @@ def webhook_purincash():
             _confirmar_pedido(pid)
     return jsonify({"ok": True})
 
-# ── Validar cupom (público, chamado via JS no checkout) ──────
+# ── Helpers de sessão ────────────────────────────────────────
+
+def get_session_id():
+    if "sid" not in session:
+        session["sid"] = secrets.token_hex(16)
+    return session["sid"]
+
+def get_discord_user():
+    """Retorna o usuário Discord logado ou None."""
+    did = session.get("discord_id")
+    if not did:
+        return None
+    row = get_conn().execute("SELECT * FROM discord_users WHERE discord_id=?", (did,)).fetchone()
+    return dict(row) if row else None
+
+# ── Discord OAuth2 ────────────────────────────────────────────
+
+DISCORD_API = "https://discord.com/api/v10"
+
+@app.route("/auth/discord")
+def auth_discord():
+    cfg = get_config()
+    client_id = cfg.get("discord_client_id", "")
+    if not client_id:
+        flash("Login com Discord não configurado.", "error")
+        return redirect(url_for("index"))
+    redirect_uri = request.url_root.rstrip("/") + "/auth/discord/callback"
+    state = secrets.token_hex(16)
+    session["oauth_state"] = state
+    # Salva de onde veio pra redirecionar depois
+    session["oauth_next"] = request.args.get("next", "/")
+    url = (f"https://discord.com/api/oauth2/authorize"
+           f"?client_id={client_id}"
+           f"&redirect_uri={redirect_uri}"
+           f"&response_type=code"
+           f"&scope=identify+email"
+           f"&state={state}")
+    return redirect(url)
+
+@app.route("/auth/discord/callback")
+def auth_discord_callback():
+    cfg = get_config()
+    client_id     = cfg.get("discord_client_id", "")
+    client_secret = cfg.get("discord_client_secret", "")
+    code  = request.args.get("code", "")
+    state = request.args.get("state", "")
+
+    if not code or state != session.pop("oauth_state", ""):
+        flash("Autenticação inválida.", "error")
+        return redirect(url_for("index"))
+
+    redirect_uri = request.url_root.rstrip("/") + "/auth/discord/callback"
+    try:
+        # Troca code por access_token
+        tr = requests.post(f"{DISCORD_API}/oauth2/token", data={
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "grant_type":    "authorization_code",
+            "code":          code,
+            "redirect_uri":  redirect_uri,
+        }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
+        tokens = tr.json()
+        access_token  = tokens.get("access_token", "")
+        refresh_token = tokens.get("refresh_token", "")
+
+        # Busca dados do usuário
+        ur = requests.get(f"{DISCORD_API}/users/@me",
+                          headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
+        u = ur.json()
+        discord_id = str(u.get("id", ""))
+        username   = u.get("username", "")
+        avatar     = u.get("avatar", "")
+        email      = u.get("email", "")
+
+        # Salva/atualiza no banco
+        con = get_conn()
+        con.execute("""INSERT OR REPLACE INTO discord_users
+            (discord_id, username, avatar, email, access_token, refresh_token, ultimo_login)
+            VALUES (?,?,?,?,?,?,datetime('now'))""",
+            (discord_id, username, avatar, email, access_token, refresh_token))
+        con.commit()
+
+        # Salva na sessão
+        session["discord_id"]       = discord_id
+        session["discord_username"] = username
+        session["discord_avatar"]   = f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar}.png" if avatar else ""
+
+        flash(f"Bem-vindo, {username}! 👋", "success")
+    except Exception as e:
+        flash("Erro ao autenticar com Discord.", "error")
+
+    next_url = session.pop("oauth_next", "/")
+    return redirect(next_url)
+
+@app.route("/auth/logout")
+def auth_logout_user():
+    session.pop("discord_id", None)
+    session.pop("discord_username", None)
+    session.pop("discord_avatar", None)
+    flash("Sessão encerrada.", "success")
+    return redirect(url_for("index"))
+
+# ── Minha Conta ───────────────────────────────────────────────
+
+@app.route("/minha-conta")
+def minha_conta():
+    cfg = get_config()
+    user = get_discord_user()
+    if not user:
+        session["oauth_next"] = "/minha-conta"
+        return redirect(url_for("auth_discord"))
+    con = get_conn()
+    pedidos = con.execute(
+        """SELECT p.*, pr.titulo as produto_nome, pr.tipo as produto_tipo,
+                  pl.nome as plano_nome, pl.dias as plano_dias
+           FROM pedidos p
+           LEFT JOIN produtos pr ON p.produto_id=pr.id
+           LEFT JOIN planos   pl ON p.plano_id=pl.id
+           WHERE p.discord_id=?
+           ORDER BY p.id DESC""",
+        (user["discord_id"],)
+    ).fetchall()
+    return render_template("minha_conta.html", cfg=cfg, user=user,
+                           pedidos=[dict(p) for p in pedidos])
+
+# ── Carrinho ──────────────────────────────────────────────────
+
+@app.route("/carrinho")
+def carrinho_ver():
+    cfg  = get_config()
+    sid  = get_session_id()
+    user = get_discord_user()
+    con  = get_conn()
+    itens = con.execute(
+        """SELECT c.*, pr.titulo, pr.imagem, pr.tipo,
+                  pl.nome as plano_nome, pl.preco, pl.dias
+           FROM carrinho c
+           JOIN produtos pr ON c.produto_id=pr.id
+           JOIN planos   pl ON c.plano_id=pl.id
+           WHERE c.session_id=?""", (sid,)
+    ).fetchall()
+    total = sum(i["preco"] for i in itens)
+    return render_template("carrinho.html", cfg=cfg, itens=[dict(i) for i in itens],
+                           total=total, user=user)
+
+@app.route("/carrinho/adicionar", methods=["POST"])
+def carrinho_adicionar():
+    sid        = get_session_id()
+    produto_id = request.form.get("produto_id")
+    plano_id   = request.form.get("plano_id")
+    user       = get_discord_user()
+    discord_id = user["discord_id"] if user else request.form.get("discord_id_temp", "")
+
+    if not produto_id or not plano_id:
+        flash("Selecione um plano.", "error")
+        return redirect(request.referrer or url_for("index"))
+
+    con = get_conn()
+    # Evita duplicata do mesmo plano no carrinho
+    existe = con.execute(
+        "SELECT id FROM carrinho WHERE session_id=? AND plano_id=?", (sid, plano_id)
+    ).fetchone()
+    if not existe:
+        con.execute(
+            "INSERT INTO carrinho (session_id, produto_id, plano_id, discord_id) VALUES (?,?,?,?)",
+            (sid, produto_id, plano_id, discord_id)
+        )
+        con.commit()
+        flash("Adicionado ao carrinho!", "success")
+    else:
+        flash("Esse plano já está no seu carrinho.", "error")
+    return redirect(url_for("carrinho_ver"))
+
+@app.route("/carrinho/remover/<int:item_id>", methods=["POST"])
+def carrinho_remover(item_id):
+    sid = get_session_id()
+    con = get_conn()
+    con.execute("DELETE FROM carrinho WHERE id=? AND session_id=?", (item_id, sid))
+    con.commit()
+    return redirect(url_for("carrinho_ver"))
+
+@app.route("/carrinho/checkout", methods=["POST"])
+def carrinho_checkout():
+    cfg        = get_config()
+    sid        = get_session_id()
+    user       = get_discord_user()
+    discord_id = request.form.get("discord_id", "").strip()
+    if user and not discord_id:
+        discord_id = user["discord_id"]
+
+    if not discord_id:
+        flash("Informe seu Discord ID.", "error")
+        return redirect(url_for("carrinho_ver"))
+
+    con   = get_conn()
+    itens = con.execute(
+        """SELECT c.*, pr.titulo, pr.tipo, pl.nome as plano_nome, pl.preco, pl.dias
+           FROM carrinho c
+           JOIN produtos pr ON c.produto_id=pr.id
+           JOIN planos   pl ON c.plano_id=pl.id
+           WHERE c.session_id=?""", (sid,)
+    ).fetchall()
+
+    if not itens:
+        flash("Carrinho vazio.", "error")
+        return redirect(url_for("carrinho_ver"))
+
+    # Cria um pedido por item do carrinho
+    pedidos_criados = []
+    for item in itens:
+        provedor = cfg.get("provedor_pix_ativo", "")
+        pix_copia_cola = ""
+        pix_qr_base64  = ""
+        payment_id     = ""
+        valor          = float(item["preco"])
+
+        if provedor == "mercadopago":
+            pix_copia_cola, pix_qr_base64, payment_id = _gerar_pix_mp(cfg, valor, item["titulo"])
+        elif provedor == "purincash":
+            cb = request.url_root.rstrip("/") + "/webhook/purincash"
+            pix_copia_cola, pix_qr_base64, payment_id = _gerar_pix_purincash(cfg, valor, item["titulo"], "tmp", cb)
+        elif provedor == "pagbank":
+            pix_copia_cola, pix_qr_base64, payment_id = _gerar_pix_pagbank(cfg, valor, item["titulo"])
+        elif provedor == "efi":
+            pix_copia_cola, pix_qr_base64, payment_id = _gerar_pix_efi(cfg, valor, item["titulo"])
+
+        cur = con.execute(
+            """INSERT INTO pedidos (produto_id, plano_id, discord_id, valor, payment_id,
+               payment_provider, pix_copia_cola, pix_qr_base64)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (item["produto_id"], item["plano_id"], discord_id,
+             valor, payment_id, provedor, pix_copia_cola, pix_qr_base64)
+        )
+        pedidos_criados.append({
+            "id": cur.lastrowid, "titulo": item["titulo"],
+            "plano_nome": item["plano_nome"], "preco": valor,
+            "pix_copia_cola": pix_copia_cola, "pix_qr_base64": pix_qr_base64,
+        })
+
+    con.commit()
+    # Limpa carrinho
+    con.execute("DELETE FROM carrinho WHERE session_id=?", (sid,))
+    con.commit()
+
+    return render_template("carrinho_checkout.html", cfg=cfg,
+                           pedidos=pedidos_criados, discord_id=discord_id, user=user)
+
+# ── Validar cupom (público) ───────────────────────────────────
 
 @app.route("/cupom/validar", methods=["POST"])
 def cupom_validar():
@@ -566,6 +835,7 @@ def admin_produto_novo():
         titulo    = request.form.get("titulo", "").strip()
         descricao = request.form.get("descricao", "").strip()
         app_id    = request.form.get("discloud_app_id", "").strip()
+        tipo      = request.form.get("tipo", "bot")
         imagem_path = ""
 
         f = request.files.get("imagem")
@@ -581,8 +851,8 @@ def admin_produto_novo():
 
         con = get_conn()
         cur = con.execute(
-            "INSERT INTO produtos (titulo, descricao, imagem, preco_base, discloud_app_id) VALUES (?,?,?,?,?)",
-            (titulo, descricao, imagem_path, preco_base, app_id)
+            "INSERT INTO produtos (titulo, descricao, imagem, preco_base, discloud_app_id, tipo) VALUES (?,?,?,?,?,?)",
+            (titulo, descricao, imagem_path, preco_base, app_id, tipo)
         )
         pid = cur.lastrowid
         for i, nome in enumerate(nomes):
@@ -592,6 +862,16 @@ def admin_produto_novo():
                     (pid, nome.strip(), float(precos[i] or 0), int(dias[i] or 30))
                 )
         con.commit()
+
+        # Sincroniza com o banco do bot
+        planos_bot = [{"name": nomes[i].strip(), "price": float(precos[i] or 0),
+                       "duration_days": int(dias[i] or 30), "emoji": "💰"}
+                      for i in range(len(nomes)) if nomes[i].strip()]
+        _bot_api("POST", "/api/products", json={
+            "name": titulo, "description": descricao,
+            "discloud_app_id": app_id or None, "plans": planos_bot
+        })
+
         flash("Produto criado com sucesso!", "success")
         sse_broadcast("produto_atualizado", {"action": "created", "id": pid})
         return redirect(url_for("admin_produtos"))
@@ -611,6 +891,7 @@ def admin_produto_editar(pid):
         titulo    = request.form.get("titulo", "").strip()
         descricao = request.form.get("descricao", "").strip()
         app_id    = request.form.get("discloud_app_id", "").strip()
+        tipo      = request.form.get("tipo", "bot")
         imagem_path = produto["imagem"]
 
         f = request.files.get("imagem")
@@ -625,8 +906,8 @@ def admin_produto_editar(pid):
         preco_base = float(precos[0]) if precos else 0
 
         con.execute(
-            "UPDATE produtos SET titulo=?, descricao=?, imagem=?, preco_base=?, discloud_app_id=? WHERE id=?",
-            (titulo, descricao, imagem_path, preco_base, app_id, pid)
+            "UPDATE produtos SET titulo=?, descricao=?, imagem=?, preco_base=?, discloud_app_id=?, tipo=? WHERE id=?",
+            (titulo, descricao, imagem_path, preco_base, app_id, tipo, pid)
         )
         con.execute("DELETE FROM planos WHERE produto_id=?", (pid,))
         for i, nome in enumerate(nomes):
@@ -879,7 +1160,64 @@ def admin_discloud_delete(app_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Admin: cupons ─────────────────────────────────────────────
+# ── Admin: produtos do bot (via API) ─────────────────────────
+
+def _bot_api(method, path, json=None):
+    """Faz uma chamada à API interna do bot. Retorna (status_code, dict)."""
+    cfg = get_config()
+    url = cfg.get("bot_api_url", "").rstrip("/")
+    key = cfg.get("bot_api_key", "")
+    if not url or not key:
+        return 0, {"erro": "API do bot não configurada"}
+    try:
+        r = requests.request(method, f"{url}{path}",
+                             headers={"X-API-Key": key, "Content-Type": "application/json"},
+                             json=json, timeout=10)
+        return r.status_code, r.json()
+    except Exception as e:
+        return 0, {"erro": str(e)}
+
+@app.route("/admin/bot/produtos")
+@login_required
+def admin_bot_produtos():
+    """Retorna os produtos cadastrados no banco do bot via API."""
+    status, data = _bot_api("GET", "/api/products")
+    return jsonify(data)
+
+@app.route("/admin/bot/pedidos")
+@login_required
+def admin_bot_pedidos():
+    """Retorna as compras do bot via API."""
+    status, data = _bot_api("GET", "/api/purchases")
+    return jsonify(data)
+
+@app.route("/admin/bot/overview")
+@login_required
+def admin_bot_overview():
+    """Retorna stats gerais do bot."""
+    status, data = _bot_api("GET", "/api/overview")
+    return jsonify(data)
+
+@app.route("/admin/bot/produtos/novo", methods=["POST"])
+@login_required
+def admin_bot_produto_novo():
+    """Cria produto direto no banco do bot via API."""
+    body = request.get_json() or {}
+    status, data = _bot_api("POST", "/api/products", json=body)
+    return jsonify(data), status if status else 500
+
+@app.route("/admin/bot/produtos/<int:pid>/editar", methods=["POST"])
+@login_required
+def admin_bot_produto_editar(pid):
+    body = request.get_json() or {}
+    status, data = _bot_api("PUT", f"/api/products/{pid}", json=body)
+    return jsonify(data), status if status else 500
+
+@app.route("/admin/bot/produtos/<int:pid>/deletar", methods=["POST"])
+@login_required
+def admin_bot_produto_deletar(pid):
+    status, data = _bot_api("DELETE", f"/api/products/{pid}")
+    return jsonify(data), status if status else 500
 
 @app.route("/admin/cupons")
 @login_required
@@ -954,6 +1292,11 @@ def admin_visual():
             "banner_cor":        request.form.get("banner_cor", "primary"),
             "dm_mensagem_extra": request.form.get("dm_mensagem_extra", ""),
         }
+        # Discord OAuth — só atualiza se preenchido
+        for campo in ("discord_client_id", "discord_client_secret"):
+            val = request.form.get(campo, "").strip()
+            if val:
+                updates[campo] = val
         set_configs(updates)
         flash("Configurações visuais salvas!", "success")
         return redirect(url_for("admin_visual"))
